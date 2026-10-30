@@ -1,0 +1,110 @@
+--- sdcc/src/z80/gen.c
++++ sdcc/src/z80/gen.c
+@@ -13665,7 +13665,25 @@
+ static void
+ genrshTwo (const iCode *ic, operand *result, operand *left, int shCount, int sign)
+ {
+-  if (IS_SM83 && sign && shCount == 15 && bitsForType (operandType (left)) == 16 &&
++  if (IS_SM83 && !optimize.codeSize && (shCount == 3 || shCount == 4) && bitsForType (operandType (left)) == 16 &&
++    bitsForType (operandType (result)) == 16 &&
++    left->aop->type == AOP_REG && result->aop->type == AOP_REG && isRegDead (A_IDX, ic) &&
++    aopIsLitVal (left->aop, 1, 1, 0x00) &&
++    !(aopInReg (left->aop, 0, HL_IDX) && aopInReg (result->aop, 0, H_IDX) &&
++      isRegDead (L_IDX, ic) && shCount >= 5 - !optimize.codeSpeed))
++    {
++      // Integer promotions can leave a known-zero high byte. Shift only the
++      // low byte; both signed and unsigned shifts have a zero high result.
++      // Preserve short shifts and the efficient ADD HL,HL paths for larger
++      // shifts, including their register-allocation choices.
++      // For code size, retain existing paths: changed register allocation
++      // can otherwise make the surrounding function larger.
++      cheapMove (ASMOP_A, 0, left->aop, 0, true);
++      AccRsh (shCount);
++      cheapMove (result->aop, 0, ASMOP_A, 0, true);
++      cheapMove (result->aop, 1, ASMOP_ZERO, 0, !aopInReg (result->aop, 0, A_IDX));
++    }
++  else if (IS_SM83 && sign && shCount == 15 && bitsForType (operandType (left)) == 16 &&
+     bitsForType (operandType (result)) == 16 &&
+     left->aop->type == AOP_REG && result->aop->type == AOP_REG && isRegDead (A_IDX, ic))
+     {
+@@ -13985,6 +14003,13 @@
+ static void
+ unpackMaskA(sym_link *type, int len)
+ {
++  if (IS_SM83 && !SPEC_USIGN (type) && len == 7)
++    {
++      // Discard the old bit 7, then copy bit 6 into the new sign position.
++      emit3 (A_ADD, ASMOP_A, ASMOP_A);
++      emit3 (A_SRA, ASMOP_A, 0);
++      return;
++    }
+   if (SPEC_USIGN (type) || len != 1)
+     {
+       emit2 ("and a, !immedbyte", ((unsigned)-1 & 0xffu) >> (8 - len));
+@@ -15918,18 +15943,27 @@
+         _push (PAIR_AF), pushed_a = true;
+       genMove (result->aop, right->aop, true, isPairDead (PAIR_HL, ic), isPairDead (PAIR_DE, ic), isPairDead (PAIR_IY, ic));
+       cheapMove (ASMOP_A, 0, result->aop, result->aop->size - 1, true);
+-      emit2 ("and a, #0x%02x", topbytemask);
+-      cost2 (2, 7, 6, 4, 8, 4, 2, 2);
+-      if (!SPEC_USIGN (resulttype)) // Sign-extend
+-        {
+-          symbol *tlbl = regalloc_dry_run ? 0 : newiTempLabel (0);
+-          emit2 ("bit %d, a", (int)(SPEC_BITINTWIDTH (resulttype) % 8 - 1));
+-          cost2 (2, 8, 6, 4, 8, 4, 2, 2);
+-          if (!regalloc_dry_run)
+-            emit2 ("jr z, !tlabel", labelKey2num (tlbl->key));
+-          emit2 ("or a, #0x%02x", ~topbytemask & 0xffu);
+-          regalloc_dry_run_cost += 4;
+-          emitLabel (tlbl);
++      if (IS_SM83 && !SPEC_USIGN (resulttype) && SPEC_BITINTWIDTH (resulttype) % 8 == 7)
++        {
++          // The unused bit 7 need not be masked before sign extension.
++          emit3 (A_ADD, ASMOP_A, ASMOP_A);
++          emit3 (A_SRA, ASMOP_A, 0);
++        }
++      else
++        {
++          emit2 ("and a, #0x%02x", topbytemask);
++          cost2 (2, 7, 6, 4, 8, 4, 2, 2);
++          if (!SPEC_USIGN (resulttype)) // Sign-extend
++            {
++              symbol *tlbl = regalloc_dry_run ? 0 : newiTempLabel (0);
++              emit2 ("bit %d, a", (int)(SPEC_BITINTWIDTH (resulttype) % 8 - 1));
++              cost2 (2, 8, 6, 4, 8, 4, 2, 2);
++              if (!regalloc_dry_run)
++                emit2 ("jr z, !tlabel", labelKey2num (tlbl->key));
++              emit2 ("or a, #0x%02x", ~topbytemask & 0xffu);
++              regalloc_dry_run_cost += 4;
++              emitLabel (tlbl);
++            }
+         }
+       cheapMove (result->aop, result->aop->size - 1, ASMOP_A, 0, true);
+ 
+--- sdcc/src/z80/peeph-sm83.def
++++ sdcc/src/z80/peeph-sm83.def
+@@ -541,3 +541,24 @@
+ 	; sm83 peephole bool2 removed redundant normalization of one bit
+ 	and	a, #0x01
+ } if notUsed('f')
++
++// With bit 7 discarded, a short accumulator rotate gives the same byte
++// as SRL or SRA. The final AND also overwrites all SM83 flags, so the
++// replacement is valid even when flags are live after this sequence.
++replace {
++	srl	a
++	and	a, #%1
++} by {
++	; sm83 peephole maskshift1 used short rotate before a low-bit mask
++	rrca
++	and	a, #%1
++} if operandsLiteral(%1), immdInRange(0 127 '+' %1 0 %2)
++
++replace {
++	sra	a
++	and	a, #%1
++} by {
++	; sm83 peephole maskshift2 used short rotate before a low-bit mask
++	rrca
++	and	a, #%1
++} if operandsLiteral(%1), immdInRange(0 127 '+' %1 0 %2)

@@ -1,0 +1,117 @@
+diff --git a/src/z80/gen.c b/src/z80/gen.c
+index 339164d..cc1a13a 100644
+--- sdcc/src/z80/gen.c
++++ sdcc/src/z80/gen.c
+@@ -9159,6 +9159,17 @@ genUminus (const iCode *ic)
+ 
+   if (IS_FLOAT (operandType (IC_LEFT (ic))))
+     genUminusFloat (ic, IC_RESULT (ic), IC_LEFT (ic));
++  else if (IS_SM83 && bitsForType (operandType (IC_RESULT (ic))) == 8 &&
++    IC_RESULT (ic)->aop->type == AOP_REG &&
++    aopInReg (IC_LEFT (ic)->aop, 0, A_IDX) && isRegDead (A_IDX, ic))
++    {
++      // SM83 has no NEG. For a byte already in A, complement and increment
++      // avoid saving the operand to another register before subtracting from 0.
++      // Only select this when A is dead, and no bit-int result mask is needed.
++      emit3 (A_CPL, 0, 0);
++      emit3 (A_INC, ASMOP_A, 0);
++      cheapMove (IC_RESULT (ic)->aop, 0, ASMOP_A, 0, true);
++    }
+   else
+     genSub (ic, IC_RESULT (ic)->aop, ASMOP_ZERO, IC_LEFT (ic)->aop);
+ 
+@@ -13564,7 +13575,21 @@ genrshOne (operand *result, operand *left, int shCount, int is_signed, const iCo
+ 
+   bool a_dead = isRegDead (A_IDX, ic);
+ 
+-  if ((IS_Z180 || IS_EZ80_Z80 || IS_Z80N) && !is_signed && shCount >= 3 && shCount <= 6 + a_dead && // Try to use mlt.
++  if (IS_SM83 && is_signed && shCount == 7 && bitsForType (operandType (left)) == 8 &&
++    bitsForType (operandType (result)) == 8)
++    {
++      // An arithmetic byte shift by 7 is a sign mask. Move the sign into
++      // carry, then broadcast it, instead of issuing seven SRA instructions.
++      if (!a_dead)
++        _push (PAIR_AF);
++      cheapMove (ASMOP_A, 0, left->aop, 0, true);
++      emit3 (A_RLCA, 0, 0);
++      emit3 (A_SBC, ASMOP_A, ASMOP_A);
++      cheapMove (result->aop, 0, ASMOP_A, 0, true);
++      if (!a_dead)
++        _pop (PAIR_AF);
++    }
++  else if ((IS_Z180 || IS_EZ80_Z80 || IS_Z80N) && !is_signed && shCount >= 3 && shCount <= 6 + a_dead && // Try to use mlt.
+     (!IS_Z80N && aopInReg (result->aop, 0, B_IDX) && isPairDead(PAIR_BC, ic) || aopInReg (result->aop, 0, D_IDX) && isPairDead(PAIR_DE, ic) || !IS_Z80N && aopInReg (result->aop, 0, H_IDX) && isPairDead(PAIR_HL, ic)))
+     {
+       PAIR_ID pair = aopInReg (result->aop, 0, B_IDX) ? PAIR_BC : (aopInReg (result->aop, 0, D_IDX) ? PAIR_DE : PAIR_HL);
+@@ -13640,7 +13665,19 @@ shiftR1Left2Result (operand *left, int offl, operand *result, int offr, int shCo
+ static void
+ genrshTwo (const iCode *ic, operand *result, operand *left, int shCount, int sign)
+ {
+-  if (IS_Z80N &&
++  if (IS_SM83 && sign && shCount == 15 && bitsForType (operandType (left)) == 16 &&
++    bitsForType (operandType (result)) == 16 &&
++    left->aop->type == AOP_REG && result->aop->type == AOP_REG && isRegDead (A_IDX, ic))
++    {
++      // The full result consists of copies of the original sign bit. Only
++      // the high input byte is needed, and both result bytes get the mask.
++      cheapMove (ASMOP_A, 0, left->aop, 1, true);
++      emit3 (A_RLCA, 0, 0);
++      emit3 (A_SBC, ASMOP_A, ASMOP_A);
++      cheapMove (result->aop, 0, ASMOP_A, 0, true);
++      cheapMove (result->aop, 1, ASMOP_A, 0, true);
++    }
++  else if (IS_Z80N &&
+     aopInReg (result->aop, 0, DE_IDX) && isRegDead (B_IDX, ic) &&
+     shCount != 8)
+     {
+diff --git a/src/z80/peeph-sm83.def b/src/z80/peeph-sm83.def
+index c9755f3..c64e429 100644
+--- sdcc/src/z80/peeph-sm83.def
++++ sdcc/src/z80/peeph-sm83.def
+@@ -516,3 +516,28 @@ replace {
+ 	; peephole sp10c increased SP by 2 through pop
+ 	pop	%3
+ } if unusedReg(%3 'bc' 'de' 'hl')
++
++// A is overwritten by carry materialization, so SBC A,A may use any old A.
++// Both forms return !C. The replacement can change H and C; require all
++// flags to be dead. This rule belongs only to SM83, not generic Z80 rules.
++replace {
++	ld	a, #0x00
++	rla
++	xor	a, #0x01
++} by {
++	; sm83 peephole bool1 materialized inverted carry directly
++	sbc	a, a
++	inc	a
++} if notUsed('f')
++
++// A masked bit is already 0 or 1. After bool1, remove its redundant
++// normalization. Keep the AND, and require dead flags for this rewrite too.
++replace {
++	and	a, #0x01
++	sub	a, #0x01
++	sbc	a, a
++	inc	a
++} by {
++	; sm83 peephole bool2 removed redundant normalization of one bit
++	and	a, #0x01
++} if notUsed('f')
+diff --git a/src/z80/ralloc2.cc b/src/z80/ralloc2.cc
+index eba5bfd..d94d27f 100644
+--- sdcc/src/z80/ralloc2.cc
++++ sdcc/src/z80/ralloc2.cc
+@@ -574,6 +574,13 @@ static bool Ainst_ok(const assignment &a, unsigned short int i, const G_t &G, co
+   const cfg_dying_t &dying = G[i].dying;
+   const bool dying_A = result_in_A || dying.find(ia.registers[REG_A][1]) != dying.end() || dying.find(ia.registers[REG_A][0]) != dying.end();
+ 
++  // genUminus can negate an ordinary byte in A using CPL / INC on SM83.
++  // Keep the exception as narrow as the code-generation path: a register
++  // result, the low input byte in A, and no surviving old value of A.
++  if(IS_SM83 && ic->op == UNARYMINUS && bitsForType(operandType(result)) == 8 &&
++    operand_byte_in_reg(left, 0, REG_A, a, i, G) && operand_in_reg(result, ia, i, G) && dying_A)
++    return(true);
++
+   if ((ic->op == EQ_OP || ic->op == NE_OP) && getSize(operandType(ic->left)) == 1 && (operand_in_reg(left, REG_A, ia, i, G) || operand_in_reg(right, REG_A, ia, i, G)) &&
+     (ifxForOp (ic->result, ic) || dying_A))
+     return(true);
